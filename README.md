@@ -42,6 +42,18 @@ Use a custom Codex home:
 ruby codex-session-sync --from openai --to otherapi --codex-home /path/to/.codex --apply
 ```
 
+Preview against the default local Codex home explicitly:
+
+```sh
+ruby codex-session-sync --from openai --to otherapi --codex-home ~/.codex
+```
+
+Apply against a copied Codex home for testing:
+
+```sh
+ruby codex-session-sync --from openai --to otherapi --codex-home /private/tmp/codex-session-sync-test-home --apply
+```
+
 Include internal guardian approval threads:
 
 ```sh
@@ -66,4 +78,3 @@ Run without `--apply` first and inspect the planned clone count before making ch
 
 - Ruby
 - `sqlite3` command-line tool
-- Local Codex data under `~/.codex`
