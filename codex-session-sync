@@ -1,0 +1,236 @@
+#!/usr/bin/env ruby
+require "fileutils"
+require "json"
+require "optparse"
+require "securerandom"
+require "time"
+
+options = {
+  codex_home: File.expand_path("~/.codex"),
+  apply: false,
+  include_guardian: false
+}
+
+parser = OptionParser.new do |parser|
+  parser.banner = "Usage: ruby codex-session-sync --from openai --to otherapi [--apply]"
+  parser.on("--from PROVIDER", "Source provider, for example openai") { |value| options[:from] = value }
+  parser.on("--to PROVIDER", "Target provider, for example otherapi") { |value| options[:to] = value }
+  parser.on("--codex-home PATH", "Codex home directory, defaults to ~/.codex") { |value| options[:codex_home] = File.expand_path(value) }
+  parser.on("--apply", "Write changes. Without this, only prints a dry-run summary") { options[:apply] = true }
+  parser.on("--dry-run", "Print a dry-run summary without writing changes") { options[:apply] = false }
+  parser.on("--include-guardian", "Also copy internal guardian approval threads") { options[:include_guardian] = true }
+end
+
+parser.parse!
+
+codex_home = options[:codex_home]
+db = File.join(codex_home, "state_5.sqlite")
+session_index = File.join(codex_home, "session_index.jsonl")
+
+def sql_quote(value)
+  return "NULL" if value.nil?
+  "'#{value.to_s.gsub("'", "''")}'"
+end
+
+def sqlite_json(db, sql)
+  output = IO.popen(["sqlite3", "-json", db, sql], &:read)
+  JSON.parse(output.empty? ? "[]" : output)
+end
+
+# Show the providers that already exist in the local Codex thread database.
+def print_provider_summary(db, codex_home)
+  unless File.exist?(db)
+    puts "\nProvider summary unavailable: missing #{db}"
+    return
+  end
+
+  rows = sqlite_json(db, <<~SQL)
+    select model_provider,
+           archived,
+           case when source like '%guardian%' then 'guardian' else 'normal' end as kind,
+           count(*) as count
+    from threads
+    group by model_provider, archived, kind
+    order by model_provider, archived, kind;
+  SQL
+
+  puts "\nProviders in #{codex_home}:"
+  if rows.empty?
+    puts "  (none found)"
+    return
+  end
+
+  rows.group_by { |row| row["model_provider"] }.each do |provider, provider_rows|
+    parts = provider_rows.map { |row| "#{row["kind"]}#{row["archived"].to_i == 1 ? ' archived' : ''}: #{row["count"]}" }
+    puts "  #{provider}: #{parts.join(', ')}"
+  end
+end
+
+if !options[:from] || !options[:to]
+  puts parser
+  print_provider_summary(db, codex_home)
+  exit(options[:from] || options[:to] ? 1 : 0)
+end
+
+abort "--from and --to must be different" if options[:from] == options[:to]
+abort "missing #{db}" unless File.exist?(db)
+
+# Rewrite only metadata fields and thread-id references in copied replay rows.
+def transform(value, id_map, from_provider, to_provider)
+  case value
+  when Hash
+    value.each do |key, child|
+      value[key] =
+        if key == "model_provider" && child == from_provider
+          to_provider
+        else
+          transform(child, id_map, from_provider, to_provider)
+        end
+    end
+  when Array
+    value.map! { |item| transform(item, id_map, from_provider, to_provider) }
+  when String
+    id_map.fetch(value, value)
+  else
+    value
+  end
+end
+
+# Make an on-disk safety copy before any real ~/.codex mutation happens.
+def backup(codex_home)
+  stamp = Time.now.strftime("%Y%m%d-%H%M%S")
+  target = File.join("/private/tmp", "codex-session-sync-backup-#{stamp}")
+  FileUtils.mkdir_p(target)
+
+  ["state_5.sqlite", "state_5.sqlite-wal", "state_5.sqlite-shm", "session_index.jsonl"].each do |name|
+    path = File.join(codex_home, name)
+    FileUtils.cp(path, File.join(target, "#{name}.bak")) if File.exist?(path)
+  end
+
+  ["sessions", "archived_sessions"].each do |name|
+    path = File.join(codex_home, name)
+    FileUtils.cp_r(path, File.join(target, "#{name}.bak")) if File.exist?(path)
+  end
+
+  target
+end
+
+# By default, sync only user-visible conversations and skip internal approval
+# review threads such as guardian sessions.
+source_filter = ["model_provider = #{sql_quote(options[:from])}"]
+source_filter << "source not like '%guardian%'" unless options[:include_guardian]
+where = source_filter.join(" and ")
+
+columns = sqlite_json(db, "pragma table_info(threads);").map { |row| row["name"] }
+source_rows = sqlite_json(db, "select * from threads where #{where} order by created_at_ms, id;")
+
+# Idempotency key: if a target-provider copy with the same stable conversation
+# attributes already exists, do not create another duplicate.
+target_keys = sqlite_json(db, <<~SQL).map { |row| [row["title"], row["cwd"], row["created_at_ms"], row["archived"]] }
+  select title, cwd, created_at_ms, archived
+  from threads
+  where model_provider = #{sql_quote(options[:to])}
+    #{options[:include_guardian] ? "" : "and source not like '%guardian%'"}
+SQL
+target_key_set = target_keys.each_with_object({}) { |key, memo| memo[key] = true }
+
+planned_rows = source_rows.reject do |row|
+  target_key_set.key?([row["title"], row["cwd"], row["created_at_ms"], row["archived"]])
+end
+id_map = planned_rows.to_h { |row| [row["id"], SecureRandom.uuid] }
+
+# Dry-run is the default output so accidental invocations never write data.
+puts JSON.pretty_generate({
+  mode: options[:apply] ? "apply" : "dry-run",
+  codex_home: codex_home,
+  from: options[:from],
+  to: options[:to],
+  include_guardian: options[:include_guardian],
+  source_threads: source_rows.length,
+  already_synced: source_rows.length - planned_rows.length,
+  planned_clones: planned_rows.length
+})
+
+planned_rows.each do |row|
+  puts "#{row["id"]} -> #{id_map.fetch(row["id"])}  #{row["title"].to_s.lines.first.to_s.strip}"
+end
+
+exit 0 unless options[:apply]
+
+backup_path = backup(codex_home)
+sql = ["begin transaction;"]
+index_lines = []
+
+planned_rows.each do |row|
+  old_id = row["id"]
+  new_id = id_map.fetch(old_id)
+  old_path = row["rollout_path"]
+
+  unless old_path && File.exist?(old_path)
+    warn "skip missing rollout #{old_id}: #{old_path}"
+    next
+  end
+
+  new_path = old_path.sub(/#{Regexp.escape(old_id)}\.jsonl\z/, "#{new_id}.jsonl")
+  new_path = old_path.sub(/\.jsonl\z/, "-#{options[:to]}-#{new_id}.jsonl") if new_path == old_path
+
+  # Replay files are copied, never modified in place, so the source provider
+  # keeps its original conversation history intact.
+  FileUtils.mkdir_p(File.dirname(new_path))
+  new_lines = File.readlines(old_path, chomp: true).map do |line|
+    JSON.generate(transform(JSON.parse(line), id_map, options[:from], options[:to]))
+  end
+  File.write(new_path, new_lines.join("\n") + "\n")
+
+  clone = row.dup
+  clone["id"] = new_id
+  clone["rollout_path"] = new_path
+  clone["model_provider"] = options[:to]
+  begin
+    clone["source"] = JSON.generate(transform(JSON.parse(clone["source"]), id_map, options[:from], options[:to]))
+  rescue JSON::ParserError, TypeError
+    # Plain source values such as "vscode" are intentionally left as-is.
+  end
+
+  values = columns.map { |column| sql_quote(clone[column]) }
+  sql << "insert into threads (#{columns.join(",")}) values (#{values.join(",")});"
+
+  updated = clone["updated_at_ms"] ? Time.at(clone["updated_at_ms"].to_f / 1000).utc : Time.at(clone["updated_at"].to_i).utc
+  index_lines << JSON.generate({
+    "id" => new_id,
+    "thread_name" => clone["title"],
+    "updated_at" => updated.iso8601(6)
+  })
+end
+
+unless id_map.empty?
+  old_ids_sql = id_map.keys.map { |id| sql_quote(id) }.join(",")
+
+  # Dynamic tool metadata is required for old conversations to reopen cleanly.
+  sqlite_json(db, "select * from thread_dynamic_tools where thread_id in (#{old_ids_sql});").each do |row|
+    sql << "insert or ignore into thread_dynamic_tools (thread_id,position,name,description,input_schema,defer_loading,namespace) values (#{sql_quote(id_map.fetch(row["thread_id"]))},#{sql_quote(row["position"])},#{sql_quote(row["name"])},#{sql_quote(row["description"])},#{sql_quote(row["input_schema"])},#{sql_quote(row["defer_loading"])},#{sql_quote(row["namespace"])});"
+  end
+
+  # Only clone parent/child links when both sides are part of this sync batch.
+  sqlite_json(db, <<~SQL).each do |row|
+    select * from thread_spawn_edges
+    where parent_thread_id in (#{old_ids_sql})
+       or child_thread_id in (#{old_ids_sql});
+  SQL
+    next unless id_map[row["parent_thread_id"]] && id_map[row["child_thread_id"]]
+    sql << "insert or ignore into thread_spawn_edges (parent_thread_id,child_thread_id,status) values (#{sql_quote(id_map.fetch(row["parent_thread_id"]))},#{sql_quote(id_map.fetch(row["child_thread_id"]))},#{sql_quote(row["status"])});"
+  end
+end
+
+sql << "commit;"
+sql_path = File.join("/private/tmp", "codex-session-sync-#{Time.now.strftime("%Y%m%d-%H%M%S")}.sql")
+File.write(sql_path, sql.join("\n") + "\n")
+system("sqlite3", db, ".read #{sql_path}", exception: true)
+File.open(session_index, "a") { |file| index_lines.each { |line| file.puts(line) } } if File.exist?(session_index)
+
+puts JSON.pretty_generate({
+  applied: true,
+  cloned_threads: planned_rows.length,
+  backup: backup_path,
+  sql: sql_path
+})
