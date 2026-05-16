@@ -8,6 +8,7 @@ This is useful when you switch Codex between the official provider and another l
 
 - Reads Codex local state from `~/.codex/state_5.sqlite`.
 - Copies matching conversation rows to a target provider name.
+- Updates an existing target-provider copy when the source-provider conversation is newer.
 - Copies replay JSONL files instead of editing the source files in place.
 - Rewrites copied replay metadata so the copied conversations belong to the target provider.
 - Copies dynamic tool metadata needed for old conversations to reopen cleanly.
@@ -49,7 +50,9 @@ ruby codex-session-sync --from openai --to otherapi --include-guardian --apply
 
 ## Safety Notes
 
-The script is designed to copy conversations, not move them. Source provider rows and source replay files are left intact.
+The script is designed to copy or update target-provider conversations, not move them. Source provider rows and source replay files are left intact.
+
+If a target-provider copy already exists, the script compares `updated_at_ms`. It updates the target copy only when the source conversation is newer; newer target conversations are not rolled back.
 
 Before writing changes, the script creates a backup under:
 

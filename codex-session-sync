@@ -10,6 +10,7 @@ options = {
   apply: false,
   include_guardian: false
 }
+DEFAULT_CODEX_HOME = File.expand_path("~/.codex")
 
 parser = OptionParser.new do |parser|
   parser.banner = "Usage: ruby codex-session-sync --from openai --to otherapi [--apply]"
@@ -34,6 +35,7 @@ end
 
 def sqlite_json(db, sql)
   output = IO.popen(["sqlite3", "-json", db, sql], &:read)
+  abort "sqlite3 query failed" unless $?.success?
   JSON.parse(output.empty? ? "[]" : output)
 end
 
@@ -96,6 +98,37 @@ def transform(value, id_map, from_provider, to_provider)
   end
 end
 
+def conversation_key(row)
+  [row["cwd"], row["created_at_ms"], row["archived"]]
+end
+
+def rewrite_replay(source_path, target_path, id_map, from_provider, to_provider)
+  new_lines = File.readlines(source_path, chomp: true).map do |line|
+    JSON.generate(transform(JSON.parse(line), id_map, from_provider, to_provider))
+  end
+  File.write(target_path, new_lines.join("\n") + "\n")
+end
+
+def transformed_source(row, target_id, target_path, id_map, from_provider, to_provider)
+  clone = row.dup
+  clone["id"] = target_id
+  clone["rollout_path"] = target_path
+  clone["model_provider"] = to_provider
+  begin
+    clone["source"] = JSON.generate(transform(JSON.parse(clone["source"]), id_map, from_provider, to_provider))
+  rescue JSON::ParserError, TypeError
+    # Plain source values such as "vscode" are intentionally left as-is.
+  end
+  clone
+end
+
+def resolve_rollout_path(path, codex_home)
+  return path if path.nil? || codex_home == DEFAULT_CODEX_HOME
+  default_prefix = "#{DEFAULT_CODEX_HOME}/"
+  return path unless path.start_with?(default_prefix)
+  File.join(codex_home, path.delete_prefix(default_prefix))
+end
+
 # Make an on-disk safety copy before any real ~/.codex mutation happens.
 def backup(codex_home)
   stamp = Time.now.strftime("%Y%m%d-%H%M%S")
@@ -123,21 +156,32 @@ where = source_filter.join(" and ")
 
 columns = sqlite_json(db, "pragma table_info(threads);").map { |row| row["name"] }
 source_rows = sqlite_json(db, "select * from threads where #{where} order by created_at_ms, id;")
-
-# Idempotency key: if a target-provider copy with the same stable conversation
-# attributes already exists, do not create another duplicate.
-target_keys = sqlite_json(db, <<~SQL).map { |row| [row["title"], row["cwd"], row["created_at_ms"], row["archived"]] }
-  select title, cwd, created_at_ms, archived
+target_rows = sqlite_json(db, <<~SQL)
+  select *
   from threads
   where model_provider = #{sql_quote(options[:to])}
     #{options[:include_guardian] ? "" : "and source not like '%guardian%'"}
 SQL
-target_key_set = target_keys.each_with_object({}) { |key, memo| memo[key] = true }
+
+# Idempotency key: if a target-provider copy with the same stable conversation
+# attributes already exists, do not create another duplicate.
+target_by_key = target_rows.each_with_object({}) { |row, memo| memo[conversation_key(row)] = row }
 
 planned_rows = source_rows.reject do |row|
-  target_key_set.key?([row["title"], row["cwd"], row["created_at_ms"], row["archived"]])
+  target_by_key.key?(conversation_key(row))
 end
-id_map = planned_rows.to_h { |row| [row["id"], SecureRandom.uuid] }
+planned_updates = source_rows.each_with_object([]) do |row, memo|
+  target = target_by_key[conversation_key(row)]
+  next unless target
+  next unless row["updated_at_ms"].to_i > target["updated_at_ms"].to_i
+  memo << [row, target]
+end
+
+id_map = {}
+source_rows.each do |row|
+  target = target_by_key[conversation_key(row)]
+  id_map[row["id"]] = target ? target["id"] : SecureRandom.uuid
+end
 
 # Dry-run is the default output so accidental invocations never write data.
 puts JSON.pretty_generate({
@@ -147,12 +191,17 @@ puts JSON.pretty_generate({
   to: options[:to],
   include_guardian: options[:include_guardian],
   source_threads: source_rows.length,
-  already_synced: source_rows.length - planned_rows.length,
-  planned_clones: planned_rows.length
+  existing_target_copies: source_rows.length - planned_rows.length,
+  up_to_date: source_rows.length - planned_rows.length - planned_updates.length,
+  planned_clones: planned_rows.length,
+  planned_updates: planned_updates.length
 })
 
 planned_rows.each do |row|
   puts "#{row["id"]} -> #{id_map.fetch(row["id"])}  #{row["title"].to_s.lines.first.to_s.strip}"
+end
+planned_updates.each do |source, target|
+  puts "update #{source["id"]} -> #{target["id"]}  #{source["title"].to_s.lines.first.to_s.strip}"
 end
 
 exit 0 unless options[:apply]
@@ -164,7 +213,7 @@ index_lines = []
 planned_rows.each do |row|
   old_id = row["id"]
   new_id = id_map.fetch(old_id)
-  old_path = row["rollout_path"]
+  old_path = resolve_rollout_path(row["rollout_path"], codex_home)
 
   unless old_path && File.exist?(old_path)
     warn "skip missing rollout #{old_id}: #{old_path}"
@@ -177,20 +226,9 @@ planned_rows.each do |row|
   # Replay files are copied, never modified in place, so the source provider
   # keeps its original conversation history intact.
   FileUtils.mkdir_p(File.dirname(new_path))
-  new_lines = File.readlines(old_path, chomp: true).map do |line|
-    JSON.generate(transform(JSON.parse(line), id_map, options[:from], options[:to]))
-  end
-  File.write(new_path, new_lines.join("\n") + "\n")
+  rewrite_replay(old_path, new_path, id_map, options[:from], options[:to])
 
-  clone = row.dup
-  clone["id"] = new_id
-  clone["rollout_path"] = new_path
-  clone["model_provider"] = options[:to]
-  begin
-    clone["source"] = JSON.generate(transform(JSON.parse(clone["source"]), id_map, options[:from], options[:to]))
-  rescue JSON::ParserError, TypeError
-    # Plain source values such as "vscode" are intentionally left as-is.
-  end
+  clone = transformed_source(row, new_id, new_path, id_map, options[:from], options[:to])
 
   values = columns.map { |column| sql_quote(clone[column]) }
   sql << "insert into threads (#{columns.join(",")}) values (#{values.join(",")});"
@@ -203,15 +241,43 @@ planned_rows.each do |row|
   })
 end
 
+planned_updates.each do |source, target|
+  source_id = source["id"]
+  target_id = target["id"]
+  source_path = resolve_rollout_path(source["rollout_path"], codex_home)
+  target_path = resolve_rollout_path(target["rollout_path"], codex_home)
+
+  unless source_path && target_path && File.exist?(source_path) && File.exist?(target_path)
+    warn "skip missing rollout #{source_id}: #{source_path} -> #{target_path}"
+    next
+  end
+
+  rewrite_replay(source_path, target_path, id_map, options[:from], options[:to])
+  clone = transformed_source(source, target_id, target_path, id_map, options[:from], options[:to])
+
+  assignments = columns.reject { |column| column == "id" }.map do |column|
+    "#{column}=#{sql_quote(clone[column])}"
+  end
+  sql << "update threads set #{assignments.join(",")} where id=#{sql_quote(target_id)};"
+  sql << "delete from thread_dynamic_tools where thread_id=#{sql_quote(target_id)};"
+
+  updated = clone["updated_at_ms"] ? Time.at(clone["updated_at_ms"].to_f / 1000).utc : Time.at(clone["updated_at"].to_i).utc
+  index_lines << JSON.generate({
+    "id" => target_id,
+    "thread_name" => clone["title"],
+    "updated_at" => updated.iso8601(6)
+  })
+end
+
 unless id_map.empty?
-  old_ids_sql = id_map.keys.map { |id| sql_quote(id) }.join(",")
+  old_ids_sql = source_rows.map { |row| sql_quote(row["id"]) }.join(",")
 
   # Dynamic tool metadata is required for old conversations to reopen cleanly.
   sqlite_json(db, "select * from thread_dynamic_tools where thread_id in (#{old_ids_sql});").each do |row|
     sql << "insert or ignore into thread_dynamic_tools (thread_id,position,name,description,input_schema,defer_loading,namespace) values (#{sql_quote(id_map.fetch(row["thread_id"]))},#{sql_quote(row["position"])},#{sql_quote(row["name"])},#{sql_quote(row["description"])},#{sql_quote(row["input_schema"])},#{sql_quote(row["defer_loading"])},#{sql_quote(row["namespace"])});"
   end
 
-  # Only clone parent/child links when both sides are part of this sync batch.
+  # Only copy parent/child links when both sides have target-provider ids.
   sqlite_json(db, <<~SQL).each do |row|
     select * from thread_spawn_edges
     where parent_thread_id in (#{old_ids_sql})
@@ -231,6 +297,7 @@ File.open(session_index, "a") { |file| index_lines.each { |line| file.puts(line)
 puts JSON.pretty_generate({
   applied: true,
   cloned_threads: planned_rows.length,
+  updated_threads: planned_updates.length,
   backup: backup_path,
   sql: sql_path
 })
